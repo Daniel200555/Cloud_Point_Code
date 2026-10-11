@@ -15,7 +15,8 @@ class WorkerManager:
         self.available_cpus = psutil.Process().cpu_affinity()
         if not self.available_cpus:
             raise RuntimeError("No available CPUs")
-
+        self.memory_reserve_ratio = 0.20
+        self.memory_safety_factor = 1.5
         self.max_workers = max(1, min(self.cpu_count - 2, len(self.available_cpus)))
 
     def reconcile(self, configs: list[UnitConfig]) -> None:
@@ -44,6 +45,8 @@ class WorkerManager:
             del self.workers[name]
 
         while len(self.workers) < self.max_workers:
+            if not self.can_start_worker():
+                break
             try:
                 config = self.queue.get_nowait()
             except Empty:
@@ -94,6 +97,49 @@ class WorkerManager:
         self._enqueue(unit_config)
         self.dispatch()
         print(f"Restart requested: {unit_config.unit_name}")
+
+    def get_active_worker_memory(self) -> list[int]:
+        memory_usage = []
+        for process in self.workers.values():
+            if process is None or process.pid is None:
+                continue
+
+            if not process.is_alive():
+                continue
+            try:
+                worker_process = psutil.Process(process.pid)
+                memory_bytes = worker_process.memory_info().rss
+                memory_usage.append(memory_bytes)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return memory_usage
+
+    def get_average_worker_memory(self) -> int:
+        memory_usage = self.get_active_worker_memory()
+        if not memory_usage:
+            return 0
+        return sum(memory_usage) // len(memory_usage)
+
+    def can_start_worker(self) -> bool:
+        memory = psutil.virtual_memory()
+        available_bytes = memory.available
+        average_worker_bytes = self.get_average_worker_memory()
+
+        reserve_bytes = int(memory.total * self.memory_reserve_ratio)
+
+        if average_worker_bytes == 0:
+            required_bytes = reserve_bytes
+        else:
+            required_bytes = (average_worker_bytes * self.memory_safety_factor + reserve_bytes)
+
+        can_start: bool = available_bytes >= required_bytes
+        print(
+            f"Available RAM: {available_bytes / 1024**2:.0f} MB | "
+            f"Average worker RAM: {average_worker_bytes / 1024**2:.0f} MB | "
+            f"Required RAM: {required_bytes / 1024**2:.0f} MB | "
+            f"Can start: {can_start}"
+        )
+        return can_start
 
     def _enqueue(self, config: UnitConfig) -> None:
         name = config.unit_name
